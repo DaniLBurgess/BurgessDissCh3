@@ -1,0 +1,303 @@
+---
+title: "Chapter 3 Experiment 1 Analysis"
+author: "Danielle Burgess"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+    number_sections: yes
+    df_print: paged
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, message=FALSE}
+# setup -----
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, fig.show='hold', results='hold')
+
+library(here) #for file referencing with here()
+library(dplyr) # for tidying data
+library(boot) #for bootstrap resampling
+library(ggplot2) #for graphing
+library(buildmer) # for model selection
+library(lme4) # for mixed effects regression modeling
+library(plotrix) #for std.error()
+
+# local functions -----
+
+# import data from PsychoPy data files, specifying rows
+# varNames = a list of the column names you want to include
+data.import <- function(file, lowerRow, upperRow, varNames){
+  data <- read.csv(file, header=T);
+  dataImp <- data[lowerRow:upperRow, varNames] 	
+  return(dataImp)	
+}
+
+# a function for swapping values in a vector with other values.
+swap <- function(vec, from, to) {
+  tmp <- to[ match(vec, from) ]
+  tmp[is.na(tmp)] <- vec[is.na(tmp)]
+  return(tmp)
+}
+
+# returns a data frame for our psychopy production data with accuracy column
+prod.import <- function(fileNames, lowerRow, upperRow) {
+  prod_vars <- c("participant","inputText","Text")
+  prod_data <- do.call("rbind", lapply(fileNames, data.import, lowerRow, upperRow, prod_vars))
+  #delete every other row
+  toDelete <- seq(1, nrow(prod_data), 2)
+  prod_data <- prod_data[toDelete,]
+  #add col for condition
+  prod_data$Condition <- ifelse(grepl("^00",prod_data$participant),"Equiprobable", 
+                                ifelse(grepl("^01",prod_data$participant),"Majority Preverbal","Majority Postverbal"))
+  prod_data$Condition <- as.factor(prod_data$Condition)
+  #add col for accuracy
+  prod_data$inputText <- as.character(prod_data$inputText)
+  prod_data$Text <- as.character(prod_data$Text)
+  prod_data$Acc <- ifelse(prod_data$inputText == prod_data$Text, 1, 0)
+  return(prod_data)
+}
+
+# returns a data frame for our psychopy FCT data with accuracy column
+fct.import <-function(fileNames, lowerRow, upperRow) {
+  FCT_vars <- c("participant","key_resp_fct.keys","correctans","word")
+  FCT_data <- do.call("rbind", lapply(fileNames, data.import, lowerRow, upperRow, FCT_vars))
+  #delete every other row
+  toDelete <- seq(1, nrow(FCT_data), 2)
+  FCT_data <- FCT_data[toDelete,]
+  #add col for condition
+  FCT_data$Condition <- ifelse(grepl("^00",FCT_data$participant),"Equiprobable",
+                           ifelse(grepl("^01",FCT_data$participant),"Majority Preverbal","Majority Postverbal"))
+  FCT_data$Condition <- as.factor(FCT_data$Condition)
+  #create column for accuracy on task, 1 is correct, 0 is incorrect
+  FCT_data$Acc <- ifelse(FCT_data$key_resp_fct.keys == FCT_data$correctans, 1, 0)
+  return(FCT_data)
+} 
+
+#returns se of a vector
+se <- function(data) sqrt(var(data)/length(data))
+
+acc.bycondition <- function(data) {
+  data2 <- aggregate(data[["Acc"]], list(data[["Condition"]],data[["participant"]]), mean)
+  colnames(data2) <- c("Condition","participant","prop")
+  data3 <- aggregate(data2$prop, list(data2$Condition), mean)
+  colnames(data3) <- c("Condition","mean")
+  data4 <- aggregate(data2$prop, list(data2$Condition), sd)
+  colnames(data4) <- c("Condition","sd")
+  data5 <- join(data3,data4)
+  return(data5)
+}
+
+id.neg.order <- function(response, NegVSentence, acc) {
+  if (acc == 0) {
+    NA
+  }
+  else {
+    if (response == NegVSentence) {
+      1
+    }
+    else {
+      0
+    }
+  }
+}
+
+```
+
+# Import Data
+
+In the experiment, participants progressed through three rounds of training. First, they were trained on nouns in the language, then affirmative SVO sentences, then negative sentences with both SNegVO and SVNegO word orders. After each round of training, participants completed both a set of forced choice task comprehension trials, where they were presented with a sentence and asked to identify which of two images matched the sentences, and a set of production trials, where they were presented with an image and asked to type the sentence in the artificial language. The final production block included a mixture of both negative sentences and affirmative target sentences.
+
+In this chunk, I create data frames for each of the following testing phases of the experiment: 
+
+  * Ch3FCT = forced choice task comprehension trials
+  * Ch3Prod = production trials
+  * negProd = negative sentence trials from final production phase
+  * finalProd = all trials from final production phase
+
+```{r production data frames}
+
+## generate list of file names
+fileNames <- list.files(path=here::here("raw_data"), pattern = "*.csv",full.names = TRUE)
+
+## import data from intermediate test phases
+#import participant production data from psychopy files
+nounProd <- prod.import(fileNames,51,74) #noun results
+affProd <- prod.import(fileNames,160,183) #aff. sentence results
+
+## import data from final production phase
+finalProd_vars <- c("participant","inputText","NegVSentence","VNegSentence","AffSentence","gather_loop.thisIndex")
+finalProd <- do.call("rbind", lapply(fileNames, data.import, 277, 312, finalProd_vars))
+finalProd <- finalProd %>% rename(item = gather_loop.thisIndex)
+
+## add columns for analysis
+# add col for condition
+finalProd$Condition <- ifelse(grepl("^00",finalProd$participant),"Equiprobable",
+                           ifelse(grepl("^01",finalProd$participant),"Majority NegV","Majority VNeg"))
+finalProd$Condition <- as.factor(finalProd$Condition)
+# add col identifying whether the trial is negative or affirmative
+finalProd$isNeg <- ifelse(grepl("None",finalProd$AffSentence),1,0)
+# add col for accuracy
+finalProd$VNegSentence[finalProd$VNegSentence == "pepo pik umi ludin"] <- "pepo umi pik ludin" #correct error
+finalProd <- finalProd %>%
+  mutate(Acc = case_when(
+    finalProd$inputText == finalProd$AffSentence ~ 1,
+    finalProd$inputText == finalProd$NegVSentence ~ 1,
+    finalProd$inputText == finalProd$VNegSentence ~ 1
+  ))
+finalProd$Acc[is.na(finalProd$Acc)] = 0
+
+## separate out negative sentence productions
+negProd <- finalProd %>% filter(isNeg==1)
+
+#label production phases
+nounProd$phase <- "NounProd"
+affProd$phase <- "AffProd"
+finalProd$phase <- "FinalProd"
+Ch3Prod <- bind_rows(nounProd,affProd,finalProd)
+remove(nounProd,affProd)
+```
+
+```{r FCT data frame}
+#import participant 2AFC data from psychopy files
+nounFCT <- fct.import(fileNames,27,50) #noun results
+affFCT <- fct.import(fileNames,148,159) #aff. sentence results
+finalFCT <- fct.import(fileNames,257,276) #review results
+
+#label FCT phases
+nounFCT$phase <- "NounFCT"
+affFCT$phase <- "AffFCT"
+finalFCT$phase <- "ReviewFCT"
+
+Ch3FCT <- rbind(nounFCT,affFCT,finalFCT)
+Ch3FCT$phase <- as.factor(Ch3FCT$phase)
+remove(nounFCT,affFCT,finalFCT)
+```
+
+
+# Accuracy
+
+## FCT Accuracy
+
+```{r summarize fct accuracy}
+# accuracy and standard error by phase and condition
+FCT_acc <- Ch3FCT %>%
+  group_by(Condition,phase) %>%
+  summarise(mean = mean(Acc),
+            se = std.error(Acc))
+
+# qccuracy by participant
+FCT_acc_byp <- Ch3FCT %>%
+  group_by(participant,Condition,phase) %>%
+  summarise(mean = mean(Acc),
+            se = std.error(Acc))
+```
+
+## Prod Accuracy
+
+```{r summarize production accuracy}
+# accuracy and standard error by phase and condition
+Prod_acc <- Ch3Prod %>%
+  group_by(Condition,phase) %>%
+  summarise(mean = mean(Acc),
+            se = std.error(Acc))
+
+Prod_acc_by_p <- Ch3Prod %>%
+  group_by(participant,Condition,phase) %>%
+  summarise(mean = mean(Acc),
+            se = std.error(Acc))
+```
+
+```{r final production stage accuracy}
+# all participants above 75% accuracy in final production phase
+finalProdAcc_byp <- finalProd %>%
+  group_by(participant,Condition) %>%
+  summarise(mean_acc = mean(Acc))
+
+# number of exluded trials is 107 of 1440 (~7%)
+table(negProd$Acc)
+```
+
+
+# NegV Order
+
+```{r calculate neg order}
+
+negProd$NegVorder <- mapply(id.neg.order,
+                            response = negProd$inputText,
+                            NegVSentence = negProd$NegVSentence,
+                            acc = negProd$Acc)
+
+NegV_byp <- negProd %>%
+  group_by(participant,Condition) %>%
+  summarise(mean_NegV = mean(NegVorder, na.rm=TRUE))
+
+# summary statistics by condition and phase
+NegV_summary <- NegV_byp %>%
+  group_by(Condition) %>%
+  summarise(mean = mean(mean_NegV),
+            se = std.error(mean_NegV))
+
+# input proportions for plotting
+NegV_summary$input_prop <- case_when(
+  NegV_summary$Condition=="Majority VNeg" ~ 0.25,
+  NegV_summary$Condition=="Majority NegV" ~ 0.75,
+  NegV_summary$Condition=="Equiprobable" ~ 0.50)
+```
+
+```{r graph negation order}
+
+NegVPlot <- ggplot(data=NegV_byp, aes(x=Condition))+
+  geom_violin(position=position_dodge(),aes(y=mean_NegV, fill=Condition),show.legend = FALSE, alpha=0.5)+
+  geom_errorbar(data=NegV_summary, aes(ymin=input_prop,ymax=input_prop),linetype="dashed", size=.4)+
+  geom_errorbar(data=NegV_summary, position=position_nudge(0.5),aes(y=mean, ymin=mean-se,ymax=mean+se),width=0.1)+
+  geom_dotplot(position="dodge", aes(y=mean_NegV), dotsize=0.3, binaxis="y", stackdir="center")+
+  geom_dotplot(data=NegV_summary, aes(y=mean,fill=Condition), dotsize=0.8, alpha=0.5, binaxis="y", stackdir="center", position_nudge(x=0.5),show.legend = FALSE)+
+  labs(x = "Input Condition", y = "Proportion of NegV Order in Production")
+NegVPlot
+
+ggsave(filename="Ch3NegVPlot.png",plot=NegVPlot,path=here("figures"),width=6,height=4,units="in")
+```
+NegV order production in the equiprobable condition is not significantly different from chance.
+
+```{r negation order model}
+
+# find maximal model that will converge
+max.model <- NegVorder ~ Condition + (1|participant) + (Condition|item)
+negV.m <- buildmer(max.model,data=negProd,family="binomial",buildmerControl=buildmerControl(direction='order', args=list(control=lmerControl(optimizer='bobyqa'))))
+# maximal model that will converge:
+# NegVorder ~ 1 + condition + (1|participant)
+(max.model <- formula(negV.m@model))
+
+negV.m <- glmer(NegVorder~Condition+(1|participant),data=negProd,family="binomial",control=glmerControl(optimizer='bobyqa'))
+summary(negV.m)
+# a non-significant intercept indicates that the proportion of NegV order productions in the equiprobable condition did not significantly differ from chance
+```
+
+# Majority Order
+
+No significant difference in production of majority order between ajority NegV Condition and Majority VNeg Condition.
+
+```{r analyze majority order}
+# create majorityOrder column
+negProd$majorityOrder <- ifelse(negProd$Condition == "Majority VNeg",
+                              ifelse(is.na(negProd$NegVorder), NA,
+                                ifelse(negProd$NegVorder == 1, 0, 1)),
+                              negProd$NegVorder)
+
+#relevel condition so Majority NegV is reference
+negProd$Condition <- relevel(negProd$Condition, ref="Majority NegV")
+
+# find maximal model that will converge
+max.model <- majorityOrder ~ Condition + (1|participant) + (Condition|item)
+maj.m <- buildmer(max.model,data=negProd,family="binomial",buildmerControl=buildmerControl(direction='order', args=list(control=lmerControl(optimizer='bobyqa'))))
+# maximal model that will converge:
+# majorityOrder ~ 1 + condition + (1|participant) + (1 | item)
+(max.model <- formula(maj.m@model))
+
+maj.m <- glmer(majorityOrder~Condition+(1|participant)+(1|item),data=negProd,family="binomial",control=glmerControl(optimizer='bobyqa'))
+summary(maj.m)
+
+```
+
